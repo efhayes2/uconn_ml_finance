@@ -3,8 +3,13 @@ import pandas as pd
 import math
 import random
 import time # Import the time module
+import os # Import os for file path operations if needed, though TradingUtils handles existence
 from dataclasses import dataclass, field
-# Note: This version loads from CSV, it does NOT import from ou_simulation_code
+from typing import List # Import List for type hinting lists
+# Import the simulation function and parameters dataclass
+from ou_simulation_code import generate_ou_paths_and_prices, OUSimParameters
+# Import the new utility class
+from trading_utils import TradingUtils # This import is now safe
 
 # --- RL Parameters Dataclass ---
 @dataclass
@@ -13,6 +18,7 @@ class RLParameters:
     Holds parameters for the Q-learning algorithm and environment.
     """
     # Trading parameters
+    # tick_size now ONLY affects price discretization grid size
     tick_size: float = 0.10
     lot_size: int = 100
     k_action_range: int = 5 # Action space is lot_size * [-k_action_range, ..., k_action_range]
@@ -20,22 +26,26 @@ class RLParameters:
     price_levels: int = 1000 # Number of discrete price levels
 
     # Cost parameters
-    spread_cost_per_lot: float = field(init=False) # Calculated from tick_size
+    # New parameter for transaction cost amount (in ticks)
+    # Defaults to the value of the default tick_size (0.10)
+    trans_cost_in_ticks: float = 0.10 * 0.0
+    spread_cost_per_lot: float = field(init=False) # Calculated from trans_cost_in_ticks
     k_star_risk_param: float = 10e-4 # Risk aversion parameter for reward
 
     # Q-learning parameters
     alpha: float = 0.001 # Learning rate
     epsilon: float = 0.1 # Exploration rate
-    gamma: float = 0.95  # Discount factor (default, not specified by user)
+    gamma: float = 0.999  # Discount factor
 
     # Training parameters
     print_frequency: int = 100 # How often to print episode progress
-    # Note: This version does not use replay buffer or batch size parameters directly
+    q_table_filename: str = 'last_q_table.csv' # New: Filename for saving/loading Q-table
 
 
     def __post_init__(self):
         """Calculate derived parameters after initialization."""
-        self.spread_cost_per_lot = self.tick_size * self.lot_size # Spread cost is tick_size * abs(delta_n_t) -> spread cost per lot is tick_size * lot_size
+        # spread_cost_per_lot is now based on trans_cost_in_ticks
+        self.spread_cost_per_lot = self.trans_cost_in_ticks * self.lot_size # Spread cost is trans_cost_in_ticks * abs(delta_n_t) -> spread cost per lot is trans_cost_in_ticks * lot_size
 
     @property
     def action_space(self):
@@ -57,10 +67,11 @@ class TradingEnvironment:
     """
     Represents the trading environment based on price paths.
     Handles state transitions, costs, and rewards.
+    Tracks cumulative portfolio value.
     """
     def __init__(self, price_paths_df: pd.DataFrame, rl_params: RLParameters):
         """
-        Initializes the trading environment.
+        Intializes the trading environment.
 
         Args:
             price_paths_df (pd.DataFrame): DataFrame containing price paths.
@@ -73,7 +84,7 @@ class TradingEnvironment:
 
         self.rl_params = rl_params
 
-        # Define discrete price levels and holding levels based on params
+        # Define discrete price levels based on tick_size
         # Price levels are tick_size * {1, ..., 1000}, capped/floored outside this range
         self.min_price = self.rl_params.tick_size * 1
         self.max_price = self.rl_params.tick_size * self.rl_params.price_levels # 0.10 * 1000 = 100.00
@@ -98,6 +109,7 @@ class TradingEnvironment:
         Discretizes a continuous price into an integer index [0, price_levels-1].
         Prices below min_price are floored to min_price bin.
         Prices above max_price are capped to max_price bin.
+        Uses self.rl_params.tick_size for discretization.
         """
         # Cap/floor price to the defined range
         clipped_price = max(self.min_price, min(self.max_price, price))
@@ -203,19 +215,19 @@ class TradingEnvironment:
             next_state_index = self.current_state_index # Stay in the last state
             reward = 0.0 # No reward from price change at the very last step
             # Optional: Add liquidation penalty/reward here
-            # e.g., if self.current_holding != 0: reward -= abs(self.current_holding) * self.rl_params.tick_size
+            # e.g., if self.current_holding != 0: reward -= abs(self.current_holding) * self.rl_params.trans_cost_in_ticks * self.rl_params.lot_size
         else:
             p_t_plus_1 = self.price_paths[self.current_path_idx, self.current_step_idx + 1]
 
             # Calculate the new holding n_t = n_{t-1} + delta_n_t
             # Clip the resulting holding to the allowed range H
             intended_n_t = self.current_holding + delta_n_t
-            n_t = self.clip_holding(intended_n_t) # Use the clip_holding method
+            # Use TradingUtils for clipping
+            n_t = TradingUtils.clip_holding(intended_n_t, self.rl_params)
 
             # Calculate costs based on the *intended* trade size delta_n_t
-            spread_cost_t = self.rl_params.tick_size * abs(delta_n_t)
-            impact_cost_t = (delta_n_t)**2 * self.rl_params.tick_size / self.rl_params.lot_size
-            total_cost_t = spread_cost_t + impact_cost_t
+            # Use TradingUtils for cost calculation
+            spread_cost_t, impact_cost_t, total_cost_t = TradingUtils.calculate_costs(delta_n_t, self.rl_params)
 
             # Calculate change in value (delta_v_t_plus_1) based on user's definition structure
             # This represents the gain/loss from holding n_t shares from t to t+1, minus the cost incurred at t
@@ -223,6 +235,10 @@ class TradingEnvironment:
 
             # Calculate the reward r_{t+1} based on user's formula
             reward = delta_v_t_plus_1 - 0.5 * self.rl_params.k_star_risk_param * (delta_v_t_plus_1)**2
+
+            # --- Update cumulative portfolio value ---
+            self.cumulative_value += delta_v_t_plus_1
+            # -----------------------------------------
 
             # Update current holding and step index
             self.current_holding = n_t
@@ -241,11 +257,14 @@ class TradingEnvironment:
         return next_state_index, reward, done
 
     def clip_holding(self, holding: int) -> int:
-        """Clips a holding amount to the nearest allowed holding level."""
-        allowed_holdings = np.array(self.rl_params.holdings_space)
-        # Find the index of the nearest allowed holding
-        nearest_idx = np.abs(allowed_holdings - holding).argmin()
-        return int(allowed_holdings[nearest_idx])
+        """
+        Clips a holding amount to the nearest allowed holding level.
+        This is now handled by TradingUtils.clip_holding.
+        Retained for clarity, but the call above uses the utility.
+        """
+        # This method is effectively replaced by the call to TradingUtils.clip_holding above
+        # but kept here for context if needed. The actual logic is in TradingUtils.
+        return TradingUtils.clip_holding(holding, self.rl_params)
 
 
 # --- Tabular Q-Learning Agent Class ---
@@ -255,7 +274,7 @@ class TabularQLearner:
     """
     def __init__(self, state_space_size: int, action_space: list[int], rl_params: RLParameters):
         """
-        Initializes the Q-learner.
+        Intializes the Q-learner.
 
         Args:
             state_space_size (int): The total number of discrete states.
@@ -267,8 +286,18 @@ class TabularQLearner:
         self.num_actions = len(action_space)
         self.rl_params = rl_params
 
-        # Initialize Q-table with zeros
-        self.q_table = np.zeros((self.state_space_size, self.num_actions))
+        # --- Load Q-table if file exists and shape matches, otherwise initialize ---
+        expected_shape = (self.state_space_size, self.num_actions)
+        loaded_q_table = TradingUtils.load_q_table(self.rl_params.q_table_filename, expected_shape)
+
+        if loaded_q_table is not None:
+            self.q_table = loaded_q_table
+        else:
+            # Initialize Q-table with zeros if loading failed or shape mismatched
+            self.q_table = np.zeros(expected_shape)
+            print("Initialized a new Q-table with zeros.")
+        # --------------------------------------------------------------------------
+
 
         # Map action values to indices (needed for Q-table lookup)
         self._action_to_index = {a: i for i, a in enumerate(self.rl_params.action_space)}
@@ -281,9 +310,6 @@ class TabularQLearner:
 
         Args:
             state_index (int): The index of the current state.
-
-        Returns:
-            int: The index of the chosen action.
         """
         # Explore: Choose a random action with probability epsilon
         if random.uniform(0, 1) < self.rl_params.epsilon:
@@ -318,6 +344,7 @@ class TabularQLearner:
         max_future_q = np.max(self.q_table[next_state_index, :])
 
         # Calculate the Q-learning target
+        # Gamma is used here to discount the VALUE of the next state, not the immediate reward 'r'
         q_target = reward + self.rl_params.gamma * max_future_q
 
         # Update the Q-value
@@ -336,11 +363,16 @@ class TabularQLearner:
         """
         print(f"Starting training for {num_episodes} episodes...")
 
+        # --- Lists to store episode results for averaging ---
+        all_episode_rewards: List[float] = []
+        all_episode_values: List[float] = []
+        # ----------------------------------------------------
+
         for episode in range(num_episodes):
             # Reset the environment for the start of a new episode (price path)
             current_state_index = env.reset(path_index=episode)
             done = False
-            total_reward = 0 # Track reward per episode
+            total_reward = 0 # Track reward per episode for the current episode
 
             # Loop through steps in the episode (time steps along the path)
             for step in range(env.num_steps):
@@ -348,6 +380,7 @@ class TabularQLearner:
                 action_index = self.choose_action(current_state_index)
 
                 # Environment takes a step based on the chosen action
+                # This updates env.cumulative_value internally
                 next_state_index, reward, done = env.step(action_index)
 
                 # Agent learns from the transition (sequential update)
@@ -361,14 +394,41 @@ class TabularQLearner:
                 if done:
                     break # End of episode/path
 
+            # --- Store results for the finished episode ---
+            all_episode_rewards.append(total_reward)
+            a_vt = env.cumulative_value
+            all_episode_values.append(a_vt)
+            # --------------------------------------------
+
             # Print progress
             if (episode + 1) % print_frequency == 0:
                 elapsed_time = time.time() - start_time if start_time is not None else 0
-                print(f"Episode {episode + 1}/{num_episodes} finished | Total Reward: {total_reward:.2f} | Elapsed Time: {elapsed_time:.2f} seconds")
+
+                # Calculate averages over all episodes so far
+                num_episodes_so_far = episode + 1
+                avg_reward_all = sum(all_episode_rewards) / num_episodes_so_far
+                avg_value_all = sum(all_episode_values) / num_episodes_so_far
+
+                # Calculate averages over the last print_frequency episodes
+                num_last_n = min(print_frequency, num_episodes_so_far) # Handle case for the very first print
+                avg_reward_last_n = sum(all_episode_rewards[-num_last_n:]) / num_last_n
+                avg_value_last_n = sum(all_episode_values[-num_last_n:]) / num_last_n
+
+
+                print(f"Episode {episode + 1}/{num_episodes} finished | "
+                      f"Avg Reward (All): {avg_reward_all:.2f} | "
+                      f"Avg Value (All): {avg_value_all:.2f} | "
+                      f"Avg Reward (Last {num_last_n}): {avg_reward_last_n:.2f} | "
+                      f"Avg Value (Last {num_last_n}): {avg_value_last_n:.2f} | "
+                      f"Elapsed Time: {elapsed_time:.2f} seconds")
 
         print("-" * 30)
         print("Training complete.")
         print("Q-table shape:", self.q_table.shape)
+
+        # --- Save the Q-table after training ---
+        TradingUtils.save_q_table(self.q_table, self.rl_params.q_table_filename)
+        # ---------------------------------------
 
 
 # --- Main Execution ---
@@ -380,9 +440,13 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------
 
     # 1) Set up all the needed parameters
-    # Use defaults for RLParameters, but add print_frequency
+    # Use defaults for RLParameters, but add print_frequency and update gamma
     rl_params = RLParameters(
-        print_frequency=100 # Print progress every 100 episodes
+        print_frequency=500, # Print progress every 100 episodes
+        gamma=0.999, # Updated gamma as requested
+        # Set trans_cost_in_ticks if you want it different from default tick_size (0.10)
+        # trans_cost_in_ticks=0.15
+        q_table_filename='last_q_table.csv' # Filename for saving/loading Q-table
     )
 
     print("RL Parameters:")
@@ -392,27 +456,18 @@ if __name__ == "__main__":
     print(f"Total State Space Size: {rl_params.state_space_size}")
     print("-" * 30)
 
-    # Load price data from the CSV file
-    # Note: This version loads from CSV, assumes ou_prices.csv exists
-    price_file = 'ou_prices.csv'
-    try:
-        # Assuming the CSV has no header and no index column
-        # We only load the number of paths specified by num_training_paths
-        # Ensure the CSV has AT LEAST num_training_paths rows
-        price_paths_df = pd.read_csv(price_file, header=None, index_col=None, nrows=num_training_paths)
-        if price_paths_df.shape[0] < num_training_paths:
-             print(f"Warning: Only {price_paths_df.shape[0]} paths available in '{price_file}', requested {num_training_paths}.")
-             num_training_paths = price_paths_df.shape[0] # Adjust number of episodes to actual loaded paths
+    # --- Set simulation parameters for data generation ---
+    sim_params = OUSimParameters(
+        num_paths=num_training_paths, # Use the variable here
+        save_prices_to_csv=False # Don't save prices to CSV during training run
+    )
 
-        print(f"Successfully loaded {price_paths_df.shape[0]} paths from '{price_file}'")
-        print(f"Shape of loaded price data (paths, steps+1): {price_paths_df.shape}")
-    except FileNotFoundError:
-        print(f"Error: Price file '{price_file}' not found.")
-        print("Please run the simulation script (ou_simulation_code) first to generate 'ou_prices.csv'.")
-        exit() # Exit if the price file is not found
-    except Exception as e:
-        print(f"Error loading price data: {e}")
-        exit()
+    # Generate price data directly using the simulation function
+    print("Generating price data...")
+    # This function is now Numba-accelerated if ou_simulation_code.py is updated
+    price_paths_df = generate_ou_paths_and_prices(sim_params)
+    print(f"Price data generated with shape (paths, steps+1): {price_paths_df.shape}")
+    print("-" * 30)
 
 
     # Instantiate the Environment
@@ -421,6 +476,7 @@ if __name__ == "__main__":
     print("Trading Environment created.")
 
     # Instantiate the Agent
+    # The agent will attempt to load the Q-table during initialization
     agent = TabularQLearner(
         state_space_size=rl_params.state_space_size,
         action_space=rl_params.action_space,
@@ -440,6 +496,7 @@ if __name__ == "__main__":
 
     # --- After Training ---
     # The agent.q_table now contains the learned Q-values.
+    # It was saved automatically at the end of agent.train()
     # You can analyze the Q-table or evaluate the agent's performance
     # using an evaluation loop (setting epsilon=0 for pure exploitation).
     # Example: print the Q-values for the first state across all actions
